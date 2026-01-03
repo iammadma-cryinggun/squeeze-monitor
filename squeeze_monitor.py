@@ -23,24 +23,40 @@ import json
 # ==================== 配置区 ====================
 import os
 
-# 代理配置（云端部署需要）
-PROXY = os.environ.get('PROXY', 'http://127.0.0.1:15236')  # 可通过环境变量覆盖
+# 🌐 云端环境检测（自动禁用代理）
+IS_CLOUD = os.environ.get('ZEAEBUR_DEPLOYMENT', '').lower() == 'true' or \
+           os.environ.get('VERCEL', '') != '' or \
+           os.environ.get('DYNO', '') != ''
+
+# 代理配置（本地需要代理，云端自动禁用）
+if IS_CLOUD:
+    # 云端环境：禁用代理
+    PROXY = None
+    print("[INFO] 检测到云端环境，已自动禁用代理")
+else:
+    # 本地环境：使用代理
+    PROXY = os.environ.get('PROXY', 'http://127.0.0.1:15236')
+    print(f"[INFO] 本地环境，使用代理: {PROXY}")
 
 # 禁用SSL警告（解决代理SSL握手问题）
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# 构建币安配置
 BINANCE_CONFIG = {
     'enableRateLimit': True,
     'options': {'defaultType': 'future'},
-    'proxies': {
-        'http': PROXY,
-        'https': PROXY,
-    },
     'timeout': 30000,  # 30秒超时
     'verify': False,  # 禁用SSL验证（解决代理SSL握手问题）
     'enableRateLimit': True
 }
+
+# 只在非云端环境添加代理配置
+if PROXY:
+    BINANCE_CONFIG['proxies'] = {
+        'http': PROXY,
+        'https': PROXY,
+    }
 
 # Telegram 配置
 TELEGRAM_TOKEN = "8216072079:AAFqJjOE81siaDQsHbFIBKBKfWh7SnTRuzI"
