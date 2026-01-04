@@ -269,7 +269,7 @@ def fetch_market_data(exchange):
     """获取市场数据（不再限制交易量）"""
     try:
         # 获取所有USDT合约的24h统计数据
-        ticker = exchange.fetch_tickers(['FUTURES/USDT'])
+        ticker = exchange.fetch_tickers()
 
         # 过滤
         filtered = []
