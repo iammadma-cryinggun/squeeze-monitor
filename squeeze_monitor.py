@@ -1,538 +1,644 @@
 # -*- coding: utf-8 -*-
 """
-山寨币轧空监控机器人
-策略逻辑：捕捉庄家通过逼空散户退出的机会
-
-核心信号：
-1. 极端负费率（<-0.1%）-> 空头过多，庄家控盘
-2. OI异常激增（短期/长期 > 2倍）-> 庄家建多头
-3. 价格突破阻力位 -> 触发空头清算
-
-作者：AI Assistant
-日期：2026-01-03
+山寨币轧空监控机器人 - Coinglass混合策略版
+策略：Coinglass费率筛选 + 主动买卖比验证 + 币安OI精确计算
+API: 04c3a7ffe78d4249968a1886f8e7af1a (初级会员，4位小数精度)
 """
 
 import ccxt
 import time
-import pandas as pd
-import requests
-from collections import deque
-from datetime import datetime
 import json
-
-# ==================== 配置区 ====================
+import requests
+import asyncio
+import aiohttp
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
 import os
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+import traceback
 
-# 🌐 云端环境检测（自动禁用代理）
-IS_CLOUD = os.environ.get('ZEABUR_DEPLOYMENT', '').lower() == 'true' or \
-           os.environ.get('VERCEL', '') != '' or \
-           os.environ.get('DYNO', '') != ''
+print("=" * 70)
+print("🔥 山寨币轧空监控机器人 v2.0")
+print("📊 策略: Coinglass混合验证 + 多维度信号")
+print(f"🕐 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 70)
 
-# 代理配置（本地需要代理，云端自动禁用）
-if IS_CLOUD:
-    # 云端环境：禁用代理
-    PROXY = None
-    print("[INFO] 检测到云端环境，已自动禁用代理")
-else:
-    # 本地环境：使用代理
-    PROXY = os.environ.get('PROXY', 'http://127.0.0.1:15236')
-    print(f"[INFO] 本地环境，使用代理: {PROXY}")
-
-# 禁用SSL警告（解决代理SSL握手问题）
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# 构建币安配置
-BINANCE_CONFIG = {
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'},
-    'timeout': 30000,  # 30秒超时
-    'verify': False,  # 禁用SSL验证（解决代理SSL握手问题）
-    'enableRateLimit': True
-}
-
-# 只在非云端环境添加代理配置
-if PROXY:
-    BINANCE_CONFIG['proxies'] = {
-        'http': PROXY,
-        'https': PROXY,
+# ==================== 配置区域 ====================
+class Config:
+    # Coinglass API配置
+    COINGLASS_API_KEY = "04c3a7ffe78d4249968a1886f8e7af1a"
+    COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com/api"
+    
+    # Telegram通知配置
+    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+    
+    # 币安交易所配置
+    BINANCE_CONFIG = {
+        'enableRateLimit': True,
+        'options': {'defaultType': 'future'},
+        'timeout': 15000,
+        'rateLimit': 1200,
+    }
+    
+    # 策略参数
+    FUNDING_THRESHOLD = -0.0018  # 资金费率阈值 -0.18%
+    OI_SURGE_RATIO = 2.0         # OI激增倍数
+    TAKER_BUY_RATIO = 1.2        # 主动买盘比率
+    VOLUME_THRESHOLD = 5000000   # 最小交易量 $5M
+    
+    # 扫描配置
+    SCAN_INTERVAL = 180  # 3分钟
+    MAX_SYMBOLS = 50     # 最多监控50个币种
+    MAX_RETRIES = 3      # API重试次数
+    
+    # 信号评分权重
+    WEIGHTS = {
+        'funding_rate': 0.40,   # 资金费率权重
+        'oi_surge': 0.30,       # OI激增权重
+        'taker_ratio': 0.20,    # 买卖比权重
+        'volume': 0.10,         # 交易量权重
     }
 
-# Telegram 配置
-TELEGRAM_TOKEN = "8216072079:AAFqJjOE81siaDQsHbFIBKBKfWh7SnTRuzI"
-TELEGRAM_CHAT_ID = "838429342"
-WECHAT_SCKEY = "SCT307134TCw1AtdGtadVA7CZhRklB0ptp"
-
-# 策略参数
-FUNDING_THRESHOLD = -0.001  # 资金费率低于 -0.1%
-OI_SURGE_RATIO = 2.0        # OI 短期均值是长期均值的 2 倍
-SHORT_WINDOW = 3            # 短期窗口（最近3次，约15分钟）
-LONG_WINDOW = 10            # 长期窗口（最近10次，约50分钟）
-SCAN_INTERVAL = 300         # 扫描间隔（5分钟，提高扫描频率）
-
-# 过滤条件 - 降低门槛以获取更多标的
-MIN_VOLUME_24H = 1_000_000   # 24h最小交易量 $1M（降低）
-MIN_PRICE = 0.0001           # 最小价格（降低）
-MAX_SYMBOLS_TO_SCAN = 100    # 限制扫描数量，防止API压力
-
-# 数据存储
-oi_history = {}
-last_alert_time = {}  # 避免重复警报
-SIGNALS_FILE = "squeeze_signals.json"  # 信号记录文件（用于统计胜率）
-
-# 胜率统计
-signals_db = []  # 存储所有信号
-
-def load_signals():
-    """加载历史信号记录"""
-    global signals_db
-    try:
-        with open(SIGNALS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            signals_db = data.get('signals', [])
-            print(f"   [OK] 已加载 {len(signals_db)} 条历史信号")
-    except FileNotFoundError:
-        signals_db = []
-        print(f"   [INFO] 首次运行，将创建新记录")
-    except Exception as e:
-        print(f"   [WARN] 加载信号记录失败: {e}")
-        signals_db = []
-
-def save_signals():
-    """保存信号记录"""
-    try:
-        data = {
-            'signals': signals_db,
-            'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        with open(SIGNALS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"   [WARN] 保存信号记录失败: {e}")
-
-def record_signal(symbol, funding_rate, oi_ratio, mark_price):
-    """记录新信号"""
-    signal = {
-        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'symbol': symbol,
-        'funding_rate': funding_rate,
-        'oi_ratio': oi_ratio,
-        'mark_price': mark_price,
-        'status': 'active',  # active / tp1_hit / stopped
-        'peak_price': mark_price,
-        'peak_profit_pct': 0.0,
-        'final_price': 0.0,
-        'final_profit_pct': 0.0
-    }
-    signals_db.append(signal)
-    save_signals()
-
-def check_existing_signals(current_prices):
-    """检查现有信号的价格表现"""
-    global signals_db
-    updated = False
-
-    for signal in signals_db:
-        if signal['status'] != 'active':
-            continue
-
-        symbol = signal['symbol']
-        if symbol not in current_prices:
-            continue
-
-        current_price = current_prices[symbol]
-        entry_price = signal['mark_price']
-
-        # 计算盈亏
-        profit_pct = (current_price - entry_price) / entry_price * 100
-
-        # 更新峰值
-        if profit_pct > signal['peak_profit_pct']:
-            signal['peak_profit_pct'] = profit_pct
-            signal['peak_price'] = current_price
-            updated = True
-
-        # 检查是否达到目标
-        if profit_pct >= 10.0:  # TP2: +10%
-            signal['status'] = 'tp2_hit'
-            signal['final_price'] = current_price
-            signal['final_profit_pct'] = profit_pct
-            updated = True
-
-            send_alert(
-                f"[SUCCESS] *轧空信号止盈: {symbol}*\n\n"
-                f"入场价格: `${entry_price:.4f}`\n"
-                f"出场价格: `${current_price:.4f}`\n"
-                f"最终盈利: `{profit_pct:+.2f}%`\n"
-                f"峰值盈利: `{signal['peak_profit_pct']:+.2f}%`\n\n"
-                f"[STATS] 这是第 {len([s for s in signals_db if s['status'] in ['tp1_hit', 'tp2_hit']])} 个成功信号",
-                "success"
-            )
-
-        elif profit_pct >= 5.0:  # TP1: +5%
-            if signal['status'] == 'active':
-                signal['status'] = 'tp1_hit'
-                updated = True
-
-        elif profit_pct <= -3.0:  # 止损: -3%
-            signal['status'] = 'stopped'
-            signal['final_price'] = current_price
-            signal['final_profit_pct'] = profit_pct
-            updated = True
-
-            send_alert(
-                f"[STOP] *轧空信号止损: {symbol}*\n\n"
-                f"入场价格: `${entry_price:.4f}`\n"
-                f"出场价格: `${current_price:.4f}`\n"
-                f"最终亏损: `{profit_pct:+.2f}%`\n\n"
-                f"[STATS] 失败信号数: {len([s for s in signals_db if s['status'] == 'stopped'])}",
-                "warning"
-            )
-
-    if updated:
-        save_signals()
-
-def show_statistics():
-    """显示胜率统计"""
-    if len(signals_db) == 0:
-        return
-
-    active = [s for s in signals_db if s['status'] == 'active']
-    success = [s for s in signals_db if s['status'] in ['tp1_hit', 'tp2_hit']]
-    failed = [s for s in signals_db if s['status'] == 'stopped']
-
-    win_rate = len(success) / (len(success) + len(failed)) * 100 if (len(success) + len(failed)) > 0 else 0
-
-    avg_profit = 0.0
-    if success:
-        avg_profit = sum(s['final_profit_pct'] for s in success) / len(success)
-
-    avg_loss = 0.0
-    if failed:
-        avg_loss = sum(s['final_profit_pct'] for s in failed) / len(failed)
-
-    print(f"\n{'='*80}")
-    print(f"[STATS] 胜率统计报告")
-    print(f"{'='*80}")
-    print(f"总信号数: {len(signals_db)}")
-    print(f"活跃中: {len(active)}")
-    print(f"已止盈: {len(success)}")
-    print(f"已止损: {len(failed)}")
-    print(f"\n胜率: {win_rate:.1f}%")
-    print(f"平均盈利: {avg_profit:+.2f}%")
-    print(f"平均亏损: {avg_loss:+.2f}%")
-
-    if active:
-        print(f"\n[ACTIVE] 活跃信号:")
-        for s in active[-5:]:  # 只显示最近5个
-            print(f"   {s['symbol']} | {s['time']} | 峰值: {s['peak_profit_pct']:+.2f}%")
-
-    print(f"{'='*80}\n")
-
-
-def send_telegram_message(message, alert_type="warning"):
-    """发送 Telegram 警报"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"Telegram发送失败: {response.text}")
-    except Exception as e:
-        print(f"Telegram发送异常: {e}")
-
-def send_wechat_message(message):
-    """发送微信警报（Server酱）"""
-    url = f"https://sctapi.ftqq.com/{WECHAT_SCKEY}.send"
-    payload = {
-        "title": "🚨 山寨币轧空预警",
-        "desp": message
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"微信发送失败: {response.text}")
-    except Exception as e:
-        print(f"微信发送异常: {e}")
-
-def send_alert(message, alert_type="warning"):
-    """发送所有渠道警报"""
-    print(f"\n{'='*80}")
-    print(f"[ALERT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(message)
-    print(f"{'='*80}\n")
-
-    send_telegram_message(message, alert_type)
-    send_wechat_message(message)
-
-def fetch_market_data(exchange):
-    """获取市场数据 - 修复版"""
-    try:
-        print("   [INFO] 正在获取市场数据...")
-        
-        # 方法1：获取所有永续合约
+# ==================== Coinglass API客户端 ====================
+class CoinglassClient:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = Config.COINGLASS_BASE_URL
+        self.session = requests.Session()
+        self.session.headers.update({
+            "accept": "application/json",
+            "coinglassSecret": api_key,
+            "User-Agent": "Mozilla/5.0"
+        })
+    
+    def get_funding_rates(self) -> List[Dict]:
+        """获取全市场资金费率数据"""
         try:
-            markets = exchange.load_markets()
-            print(f"   [DEBUG] 加载的市场总数: {len(markets)}")
+            url = f"{self.base_url}/futures/funding-rate/exchange-list"
+            response = self.session.get(url, timeout=10)
             
-            # 过滤永续合约
-            perpetual_symbols = []
-            for symbol, market in markets.items():
-                # 检查是否为永续合约
-                if market.get('future') and 'USDT' in symbol and 'PERP' in symbol:
-                    # 获取合约信息
-                    contract_type = market.get('info', {}).get('contractType', '')
-                    if contract_type == 'PERPETUAL':
-                        perpetual_symbols.append(symbol.replace(':', ''))  # 移除可能的分隔符
-            
-            print(f"   [DEBUG] 永续合约数量: {len(perpetual_symbols)}")
-            
-            # 只取前 MAX_SYMBOLS_TO_SCAN 个
-            if len(perpetual_symbols) > MAX_SYMBOLS_TO_SCAN:
-                perpetual_symbols = perpetual_symbols[:MAX_SYMBOLS_TO_SCAN]
-            
-            return perpetual_symbols
-            
-        except Exception as e:
-            print(f"   [WARN] 方法1失败: {e}")
-            
-        # 方法2：备选方案，直接从API获取
-        try:
-            # 尝试获取交易所信息
-            exchange_info = exchange.public_get_exchangeinfo()
-            symbols_info = exchange_info.get('symbols', [])
-            
-            filtered_symbols = []
-            for symbol_info in symbols_info:
-                symbol = symbol_info.get('symbol', '')
-                contract_type = symbol_info.get('contractType', '')
-                quote_asset = symbol_info.get('quoteAsset', '')
+            if response.status_code == 200:
+                data = response.json()
+                symbols = []
                 
-                # 过滤条件：永续合约且为USDT计价
-                if contract_type == 'PERPETUAL' and quote_asset == 'USDT':
-                    filtered_symbols.append(symbol)
-            
-            print(f"   [DEBUG] 通过API获取的永续合约数量: {len(filtered_symbols)}")
-            
-            # 限制数量
-            if len(filtered_symbols) > MAX_SYMBOLS_TO_SCAN:
-                filtered_symbols = filtered_symbols[:MAX_SYMBOLS_TO_SCAN]
-            
-            return filtered_symbols
-            
-        except Exception as e:
-            print(f"   [WARN] 方法2失败: {e}")
-            
-        # 方法3：硬编码常见合约
-        print("   [WARN] 使用硬编码合约列表")
-        return [
-            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-            'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'LINKUSDT',
-            'MATICUSDT', 'SHIBUSDT', 'TRXUSDT', 'UNIUSDT', 'ATOMUSDT'
-        ]
-        
-    except Exception as e:
-        print(f"   [ERROR] 获取市场数据失败: {e}")
-        return []
-
-def fetch_data():
-    """获取币安合约的费率和持仓量数据"""
-    exchange = ccxt.binance(BINANCE_CONFIG)
-
-    try:
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 开始扫描...")
-
-        # 1. 获取市场数据
-        all_symbols = fetch_market_data(exchange)
-        
-        if not all_symbols:
-            print("   [ERROR] 无法获取市场数据，请检查网络连接")
-            return
-            
-        print(f"   [OK] 监控币种数: {len(all_symbols)}")
-        if len(all_symbols) > 0:
-            print(f"   [示例] 前5个币种: {all_symbols[:5]}")
-
-        # 2. 获取所有交易对的资金费率
-        try:
-            funding_rates = exchange.fetch_funding_rates()
-            print(f"   [OK] 获取资金费率数据: {len(funding_rates)} 个")
-        except Exception as e:
-            print(f"   [ERROR] 获取资金费率失败: {e}")
-            return
-
-        current_prices = {}
-        alert_count = 0
-        scan_count = 0
-
-        # 3. 检查现有信号的表现（先获取价格）
-        for symbol in all_symbols:
-            try:
-                # 获取最新价格
-                ticker = exchange.fetch_ticker(symbol)
-                current_prices[symbol] = ticker['last']
-            except:
-                continue
-        
-        if current_prices:
-            check_existing_signals(current_prices)
-
-        # 4. 逐个分析新信号
-        for symbol in all_symbols:
-            scan_count += 1
-            
-            # 显示进度
-            if scan_count % 20 == 0:
-                print(f"   [PROGRESS] 已扫描 {scan_count}/{len(all_symbols)} 个币种")
-
-            try:
-                # 获取资金费率
-                if symbol in funding_rates:
-                    funding_data = funding_rates[symbol]
-                    funding_rate = funding_data.get('fundingRate', 0)
-                    mark_price = funding_data.get('markPrice', 0)
+                if data.get("code") == "200" and "data" in data:
+                    for item in data["data"]:
+                        try:
+                            # 解析资金费率
+                            rate_str = str(item.get("rate", "0")).replace("%", "")
+                            rate = float(rate_str) / 100 if rate_str else 0
+                            
+                            # 只关注负费率且是币安的合约
+                            if (rate < 0 and 
+                                item.get("exchangeName", "").lower() == "binance" and
+                                item.get("symbol", "").endswith("USDT")):
+                                
+                                symbols.append({
+                                    "symbol": item["symbol"],
+                                    "funding_rate": rate,
+                                    "next_funding": item.get("nextFundingTime", ""),
+                                    "exchange": item["exchangeName"]
+                                })
+                        except:
+                            continue
                     
-                    # 获取持仓量
-                    try:
-                        oi_data = exchange.fetch_open_interest(symbol)
-                        current_oi = oi_data['openInterestAmount']
-                    except Exception as e:
-                        # print(f"   [DEBUG] {symbol} OI获取失败: {e}")
-                        continue
-
-                    # 更新历史记录
-                    if symbol not in oi_history:
-                        oi_history[symbol] = deque(maxlen=LONG_WINDOW)
-                    oi_history[symbol].append(current_oi)
-
-                    # 执行策略逻辑判断
-                    if check_strategy(symbol, funding_rate, mark_price):
-                        alert_count += 1
-                        
-            except Exception as e:
-                # print(f"   [DEBUG] {symbol} 处理失败: {e}")
-                continue
-
-        print(f"   [OK] 扫描完成: {scan_count} 个币种")
-        if alert_count > 0:
-            print(f"   [ALERT] 发现 {alert_count} 个新轧空信号")
-        else:
-            print(f"   [OK] 未发现轧空信号")
-
-        # 每次扫描后显示统计报告（便于调试）
-        if scan_count > 0:
-            show_statistics()
-
-    except Exception as e:
-        print(f"数据获取异常: {e}")
-        import traceback
-        traceback.print_exc()
-
-def check_strategy(symbol, funding_rate, mark_price):
-    """检查是否满足轧空信号"""
-    if symbol not in oi_history:
-        return False
-        
-    history = list(oi_history[symbol])
-
-    # 数据不足，跳过
-    if len(history) < LONG_WINDOW:
-        return False
-
-    # 计算 OI 均值
-    short_term_oi = sum(history[-SHORT_WINDOW:]) / SHORT_WINDOW
-    long_term_oi = sum(history) / LONG_WINDOW
-
-    # 避免 ZeroDivisionError
-    if long_term_oi == 0:
-        return False
-
-    oi_ratio = short_term_oi / long_term_oi
-
-    # 条件判断
-    cond1 = funding_rate <= FUNDING_THRESHOLD  # 极端负费率
-    cond2 = oi_ratio >= OI_SURGE_RATIO         # OI 激增
-
-    if cond1 and cond2:
-        # 避免重复警报（1小时内不重复）
-        current_time = time.time()
-        if symbol in last_alert_time:
-            if current_time - last_alert_time[symbol] < 3600:
-                return False
-
-        last_alert_time[symbol] = current_time
-
-        # 记录信号（用于统计胜率）
-        record_signal(symbol, funding_rate, oi_ratio, mark_price)
-
-        # 构建警报消息
-        msg = (
-            f"[SQUEEZE] *山寨币轧空预警: {symbol}*\n\n"
-            f"[METRICS] 核心指标:\n"
-            f"● 资金费率: `{funding_rate:.4%}` "
-            f"{'[极端负值]' if funding_rate < -0.001 else ''}\n"
-            f"● OI 激增: `{oi_ratio:.2f}x` "
-            f"{'[异常]' if oi_ratio >= 2.0 else ''}\n"
-            f"● 当前 OI: `{history[-1]:,.0f}`\n"
-            f"● 标记价格: `${mark_price:.4f}`\n\n"
-            f"[LOGIC] 策略逻辑:\n"
-            f"1. 极端负费率 -> 空头过多，庄家控盘\n"
-            f"2. OI 激增 -> 庄家建多头头寸\n"
-            f"3. 潜在轧空 -> 突破阻力位触发空头清算\n\n"
-            f"[ACTION] 操作建议:\n"
-            f"• 结合技术分析确认入场点\n"
-            f"• 设置止损 -3%\n"
-            f"• 目标盈利 +5% ~ +10%\n"
-            f"• 注意快速行情，及时止盈"
-        )
-
-        send_alert(msg, "warning")
-        return True
-
-    return False
-
-def main():
-    """主循环"""
-    # 加载历史信号
-    load_signals()
-
-    print("="*80)
-    print("[START] 山寨币轧空监控机器人已启动")
-    print("="*80)
-    print(f"[CONFIG] 监控配置:")
-    print(f"   - 扫描频率: 每 {SCAN_INTERVAL//60} 分钟")
-    print(f"   - 监控范围: 主要USDT永续合约")
-    print(f"   - 费率阈值: {FUNDING_THRESHOLD:.1%}")
-    print(f"   - OI 激增倍数: {OI_SURGE_RATIO}x")
-    print(f"   - 止盈: TP1 +5%, TP2 +10%")
-    print(f"   - 止损: -3%")
-    print(f"\n[STATS] 胜率统计:")
-    if len(signals_db) > 0:
-        show_statistics()
-    else:
-        print(f"   [INFO] 首次运行，将记录所有信号")
-    print("="*80)
-
-    # 启动通知
-    send_alert("[START] 山寨币轧空监控机器人已启动\n\n开始扫描市场...", "info")
-
-    while True:
-        try:
-            fetch_data()
-            print(f"[TIME] 下次扫描: {SCAN_INTERVAL//60} 分钟后\n")
-            time.sleep(SCAN_INTERVAL)
-        except KeyboardInterrupt:
-            print("\n\n[WARN] 用户中断，程序停止")
-            break
+                    print(f"[Coinglass] 获取到 {len(symbols)} 个负费率币种")
+                    return symbols
+                else:
+                    print(f"[Coinglass] API响应异常: {data.get('msg', 'Unknown error')}")
+            else:
+                print(f"[Coinglass] 请求失败: HTTP {response.status_code}")
+                
         except Exception as e:
-            print(f"\n[ERROR] 程序异常: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(60)  # 异常后等待1分钟再重试
+            print(f"[Coinglass] 获取资金费率失败: {e}")
+        
+        return []
+    
+    def get_taker_buy_sell_ratio(self, symbol: str, period: str = "h4") -> Optional[float]:
+        """获取主动买卖比率"""
+        try:
+            url = f"{self.base_url}/futures/taker-buy-sell-volume/exchange-list"
+            params = {"symbol": symbol, "range": period}
+            
+            response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == "200" and "data" in data:
+                    # 解析买卖比数据，取最新值
+                    for exchange_data in data["data"]:
+                        if exchange_data.get("exchangeName", "").lower() == "binance":
+                            buy_vol = float(exchange_data.get("buyVol", 0))
+                            sell_vol = float(exchange_data.get("sellVol", 0))
+                            
+                            if sell_vol > 0:
+                                ratio = buy_vol / sell_vol
+                                return ratio
+            return None
+            
+        except Exception as e:
+            print(f"[Coinglass] 获取买卖比失败 {symbol}: {e}")
+            return None
+
+# ==================== 币安客户端 ====================
+class BinanceClient:
+    def __init__(self):
+        self.exchange = ccxt.binance(Config.BINANCE_CONFIG)
+        self.oi_history = defaultdict(lambda: deque(maxlen=20))
+        self.price_history = defaultdict(lambda: deque(maxlen=50))
+    
+    def get_precise_oi(self, symbol: str) -> Optional[float]:
+        """获取精确的持仓量数据（无精度损失）"""
+        try:
+            oi_data = self.exchange.fetch_open_interest(symbol)
+            oi = oi_data.get("openInterestAmount", 0)
+            
+            # 更新历史记录
+            if symbol in self.oi_history:
+                prev_oi = self.oi_history[symbol][-1] if self.oi_history[symbol] else 0
+                if prev_oi > 0:
+                    oi_change = (oi - prev_oi) / prev_oi * 100
+                else:
+                    oi_change = 0
+            else:
+                oi_change = 0
+            
+            self.oi_history[symbol].append(oi)
+            return {"oi": oi, "change": oi_change}
+            
+        except Exception as e:
+            print(f"[Binance] 获取OI失败 {symbol}: {e}")
+            return None
+    
+    def get_market_data(self, symbol: str) -> Optional[Dict]:
+        """获取综合市场数据"""
+        try:
+            # 获取ticker数据
+            ticker = self.exchange.fetch_ticker(symbol)
+            
+            # 获取K线计算波动率
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '5m', limit=20)
+            volatility = 0
+            
+            if len(ohlcv) >= 10:
+                closes = [c[4] for c in ohlcv[-10:]]
+                returns = [(closes[i] - closes[i-1]) / closes[i-1] 
+                          for i in range(1, len(closes))]
+                if returns:
+                    volatility = pd.Series(returns).std() * 100
+            
+            # 更新价格历史
+            self.price_history[symbol].append(ticker['last'])
+            
+            return {
+                "price": ticker['last'],
+                "volume_24h": ticker.get('quoteVolume', 0),
+                "high_24h": ticker.get('high', 0),
+                "low_24h": ticker.get('low', 0),
+                "change_24h": ticker.get('percentage', 0),
+                "volatility": volatility,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"[Binance] 获取市场数据失败 {symbol}: {e}")
+            return None
+
+# ==================== 信号分析引擎 ====================
+class SignalAnalyzer:
+    def __init__(self):
+        self.signals_history = []
+        self.alert_cooldown = {}
+    
+    def calculate_squeeze_score(self, data: Dict) -> Dict:
+        """计算轧空综合评分"""
+        score = 0
+        details = {}
+        
+        # 1. 资金费率评分（0-40分）
+        funding_rate = data.get('funding_rate', 0)
+        if funding_rate < -0.003:
+            score += 40
+            details['funding'] = "极度负值(40分)"
+        elif funding_rate < -0.002:
+            score += 30
+            details['funding'] = "高度负值(30分)"
+        elif funding_rate < -0.0015:
+            score += 20
+            details['funding'] = "中度负值(20分)"
+        elif funding_rate < -0.001:
+            score += 10
+            details['funding'] = "轻度负值(10分)"
+        
+        # 2. OI激增评分（0-30分）
+        oi_ratio = data.get('oi_ratio', 1)
+        oi_change = data.get('oi_change', 0)
+        
+        if oi_ratio > 2.5:
+            score += 30
+            details['oi'] = f"异常激增({oi_ratio:.2f}x, 30分)"
+        elif oi_ratio > 2.0:
+            score += 20
+            details['oi'] = f"显著激增({oi_ratio:.2f}x, 20分)"
+        elif oi_ratio > 1.5:
+            score += 10
+            details['oi'] = f"温和增长({oi_ratio:.2f}x, 10分)"
+        
+        if oi_change > 30:
+            score += 10
+            details['oi_change'] = f"快速增长(+{oi_change:.1f}%)"
+        
+        # 3. 主动买卖比评分（0-20分）
+        taker_ratio = data.get('taker_ratio', 1)
+        if taker_ratio > 1.5:
+            score += 20
+            details['taker'] = f"强烈买盘({taker_ratio:.2f}, 20分)"
+        elif taker_ratio > 1.2:
+            score += 15
+            details['taker'] = f"积极买盘({taker_ratio:.2f}, 15分)"
+        elif taker_ratio > 1.0:
+            score += 10
+            details['taker'] = f"买盘占优({taker_ratio:.2f}, 10分)"
+        
+        # 4. 交易量评分（0-10分）
+        volume = data.get('volume_24h', 0)
+        if volume > 50000000:  # 50M
+            score += 10
+            details['volume'] = "高流动性(10分)"
+        elif volume > 10000000:  # 10M
+            score += 7
+            details['volume'] = "良好流动性(7分)"
+        elif volume > 5000000:   # 5M
+            score += 5
+            details['volume'] = "基本流动性(5分)"
+        
+        # 确定信号等级
+        if score >= 70:
+            signal_level = "STRONG"
+            emoji = "🔥🔥🔥"
+        elif score >= 50:
+            signal_level = "MEDIUM"
+            emoji = "🔥🔥"
+        elif score >= 30:
+            signal_level = "WEAK"
+            emoji = "🔥"
+        else:
+            signal_level = "NO_SIGNAL"
+            emoji = "⚪"
+        
+        return {
+            "total_score": score,
+            "signal_level": signal_level,
+            "emoji": emoji,
+            "details": details,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def should_alert(self, symbol: str, score: int) -> bool:
+        """检查是否应该发送警报"""
+        current_time = time.time()
+        
+        # 冷却期检查
+        if symbol in self.alert_cooldown:
+            last_alert = self.alert_cooldown[symbol]
+            if current_time - last_alert < 7200:  # 2小时冷却
+                return False
+        
+        # 只有强信号才立即警报
+        if score >= 70:
+            self.alert_cooldown[symbol] = current_time
+            return True
+        elif score >= 50:
+            # 中等信号每4小时只提醒一次
+            if symbol not in self.alert_cooldown or current_time - self.alert_cooldown[symbol] > 14400:
+                self.alert_cooldown[symbol] = current_time
+                return True
+        
+        return False
+
+# ==================== 通知管理器 ====================
+class NotificationManager:
+    def __init__(self):
+        self.telegram_token = Config.TELEGRAM_TOKEN
+        self.chat_id = Config.TELEGRAM_CHAT_ID
+        
+    def send_telegram(self, message: str):
+        """发送Telegram通知"""
+        if not self.telegram_token or not self.chat_id:
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            }
+            
+            response = requests.post(url, json=payload, timeout=10)
+            return response.status_code == 200
+            
+        except Exception as e:
+            print(f"[Telegram] 发送失败: {e}")
+            return False
+    
+    def format_squeeze_alert(self, symbol: str, data: Dict, analysis: Dict) -> str:
+        """格式化轧空警报消息"""
+        score = analysis["total_score"]
+        level = analysis["signal_level"]
+        emoji = analysis["emoji"]
+        details = analysis["details"]
+        
+        # 基础信息
+        message = f"{emoji} *轧空信号警报 - {symbol}*\n"
+        message += f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        message += f"• **综合评分**: `{score}/100` ({level})\n"
+        message += f"• **资金费率**: `{data['funding_rate']:.4%}`\n"
+        
+        # 详细评分
+        for key, desc in details.items():
+            message += f"• **{key.upper()}**: {desc}\n"
+        
+        # 市场数据
+        message += f"\n📊 *市场数据:*\n"
+        message += f"• 价格: `${data['price']:.6f}`\n"
+        if 'volume_24h' in data:
+            message += f"• 24h交易量: `${data['volume_24h']/1_000_000:.1f}M`\n"
+        if 'volatility' in data:
+            message += f"• 5m波动率: `{data['volatility']:.2f}%`\n"
+        
+        # OI数据
+        if 'oi_ratio' in data:
+            message += f"• OI激增比: `{data['oi_ratio']:.2f}x`\n"
+        if 'oi_change' in data:
+            message += f"• OI变化: `{data['oi_change']:+.1f}%`\n"
+        
+        # 买卖比
+        if 'taker_ratio' in data:
+            message += f"• 主动买盘比: `{data['taker_ratio']:.2f}`\n"
+        
+        # 操作建议
+        message += f"\n⚡ *操作建议:*\n"
+        
+        if score >= 70:
+            message += f"• **信号强度**: 强烈轧空信号\n"
+            message += f"• **入场时机**: 突破阻力或放量上涨\n"
+            message += f"• **止损**: -2% (严格风控)\n"
+            message += f"• **目标**: +8% ~ +20% (分批止盈)\n"
+            message += f"• **仓位**: 可适当增加仓位\n"
+        elif score >= 50:
+            message += f"• **信号强度**: 中等轧空信号\n"
+            message += f"• **入场时机**: 等待确认突破\n"
+            message += f"• **止损**: -3%\n"
+            message += f"• **目标**: +5% ~ +12%\n"
+            message += f"• **仓位**: 轻仓试单\n"
+        else:
+            message += f"• **信号强度**: 弱信号，观察为主\n"
+            message += f"• **建议**: 等待更强信号确认\n"
+        
+        message += f"\n⏰ *时间*: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        message += f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+        
+        return message
+
+# ==================== 主监控引擎 ====================
+class SqueezeMonitor:
+    def __init__(self):
+        self.coinglass = CoinglassClient(Config.COINGLASS_API_KEY)
+        self.binance = BinanceClient()
+        self.analyzer = SignalAnalyzer()
+        self.notifier = NotificationManager()
+        self.monitoring_symbols = set()
+        self.scan_count = 0
+        
+    async def analyze_symbol(self, symbol_info: Dict) -> Optional[Dict]:
+        """分析单个币种的轧空潜力"""
+        symbol = symbol_info["symbol"]
+        
+        try:
+            print(f"  🔍 分析 {symbol}...")
+            
+            # 1. 获取买卖比数据
+            taker_ratio = self.coinglass.get_taker_buy_sell_ratio(symbol, "h4")
+            
+            # 2. 获取币安精确OI数据
+            oi_data = self.binance.get_precise_oi(symbol)
+            if not oi_data:
+                return None
+            
+            # 3. 获取市场数据
+            market_data = self.binance.get_market_data(symbol)
+            if not market_data:
+                return None
+            
+            # 4. 交易量过滤
+            if market_data["volume_24h"] < Config.VOLUME_THRESHOLD:
+                return None
+            
+            # 5. 计算OI历史比率
+            oi_history = list(self.binance.oi_history[symbol])
+            if len(oi_history) >= 10:
+                short_avg = sum(oi_history[-5:]) / 5 if len(oi_history) >= 5 else oi_data["oi"]
+                long_avg = sum(oi_history[-10:]) / 10 if len(oi_history) >= 10 else oi_data["oi"]
+                oi_ratio = short_avg / long_avg if long_avg > 0 else 1
+            else:
+                oi_ratio = 1
+            
+            # 6. 组合数据
+            analysis_data = {
+                "symbol": symbol,
+                "funding_rate": symbol_info["funding_rate"],
+                "taker_ratio": taker_ratio or 1.0,
+                "oi": oi_data["oi"],
+                "oi_change": oi_data["change"],
+                "oi_ratio": oi_ratio,
+                "price": market_data["price"],
+                "volume_24h": market_data["volume_24h"],
+                "volatility": market_data["volatility"],
+            }
+            
+            # 7. 计算综合评分
+            score_result = self.analyzer.calculate_squeeze_score(analysis_data)
+            
+            if score_result["signal_level"] != "NO_SIGNAL":
+                analysis_data.update(score_result)
+                return analysis_data
+                
+        except Exception as e:
+            print(f"  分析{symbol}时出错: {e}")
+        
+        return None
+    
+    async def scan_cycle(self):
+        """执行一次完整的扫描周期"""
+        print(f"\n📡 第{self.scan_count + 1}次扫描开始...")
+        start_time = time.time()
+        
+        # 1. 从Coinglass获取负费率币种
+        negative_funding = self.coinglass.get_funding_rates()
+        
+        if not negative_funding:
+            print("⚠️  未获取到负费率币种，跳过本次扫描")
+            return
+        
+        # 2. 筛选前N个币种
+        scan_symbols = negative_funding[:Config.MAX_SYMBOLS]
+        print(f"📊 筛选出 {len(scan_symbols)} 个候选币种")
+        
+        # 3. 并行分析所有币种
+        tasks = []
+        for symbol_info in scan_symbols:
+            tasks.append(self.analyze_symbol(symbol_info))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 4. 处理分析结果
+        valid_signals = []
+        for result in results:
+            if isinstance(result, dict):
+                valid_signals.append(result)
+            elif isinstance(result, Exception):
+                continue
+        
+        # 5. 发送警报
+        alert_count = 0
+        for signal_data in valid_signals:
+            symbol = signal_data["symbol"]
+            score = signal_data["total_score"]
+            
+            if self.analyzer.should_alert(symbol, score):
+                # 发送Telegram警报
+                alert_msg = self.notifier.format_squeeze_alert(
+                    symbol, signal_data, signal_data
+                )
+                
+                if self.notifier.send_telegram(alert_msg):
+                    print(f"   ✅ 已发送 {symbol} 警报 (评分: {score})")
+                    alert_count += 1
+                
+                # 添加到历史记录
+                self.analyzer.signals_history.append({
+                    "time": datetime.now().isoformat(),
+                    "symbol": symbol,
+                    "score": score,
+                    "data": signal_data
+                })
+        
+        # 6. 更新统计
+        elapsed = time.time() - start_time
+        self.scan_count += 1
+        
+        print(f"\n📈 扫描完成!")
+        print(f"   • 耗时: {elapsed:.1f}秒")
+        print(f"   • 分析币种: {len(scan_symbols)}个")
+        print(f"   • 有效信号: {len(valid_signals)}个")
+        print(f"   • 发送警报: {alert_count}个")
+        
+        # 7. 显示统计摘要
+        if valid_signals:
+            print(f"\n🏆 本次扫描发现信号:")
+            for signal in valid_signals[:5]:  # 显示前5个
+                print(f"   • {signal['symbol']}: {signal['total_score']}分 ({signal['signal_level']})")
+        
+        return valid_signals
+    
+    def show_statistics(self):
+        """显示运行统计"""
+        if not self.analyzer.signals_history:
+            return
+        
+        total_signals = len(self.analyzer.signals_history)
+        strong_signals = len([s for s in self.analyzer.signals_history if s["score"] >= 70])
+        medium_signals = len([s for s in self.analyzer.signals_history if s["score"] >= 50])
+        
+        print(f"\n{'='*60}")
+        print(f"📊 运行统计 (总扫描: {self.scan_count}次)")
+        print(f"{'='*60}")
+        print(f"• 总信号数: {total_signals}")
+        print(f"• 强信号数: {strong_signals}")
+        print(f"• 中信号数: {medium_signals}")
+        
+        if total_signals > 0:
+            avg_score = sum(s["score"] for s in self.analyzer.signals_history) / total_signals
+            print(f"• 平均评分: {avg_score:.1f}")
+        
+        # 显示最近信号
+        if self.analyzer.signals_history:
+            recent = self.analyzer.signals_history[-3:]
+            print(f"\n🕐 最近信号:")
+            for signal in recent:
+                time_str = datetime.fromisoformat(signal["time"]).strftime("%H:%M")
+                print(f"   {time_str} | {signal['symbol']}: {signal['score']}分")
+        
+        print(f"{'='*60}")
+    
+    async def run(self):
+        """主运行循环"""
+        print("\n🎯 监控策略配置:")
+        print(f"   • 扫描间隔: {Config.SCAN_INTERVAL//60}分钟")
+        print(f"   • 费率阈值: {Config.FUNDING_THRESHOLD:.3%}")
+        print(f"   • OI激增比: {Config.OI_SURGE_RATIO}x")
+        print(f"   • 买盘比率: {Config.TAKER_BUY_RATIO}+")
+        print(f"   • 交易量过滤: ${Config.VOLUME_THRESHOLD/1_000_000:.0f}M")
+        print(f"   • 最大监控数: {Config.MAX_SYMBOLS}")
+        print("="*70)
+        
+        # 初始测试
+        print("\n🔧 初始化测试...")
+        test_symbols = self.coinglass.get_funding_rates()
+        if not test_symbols:
+            print("❌ Coinglass API测试失败，请检查API Key")
+            return
+        
+        print(f"✅ Coinglass API连接成功")
+        print(f"✅ 检测到 {len(test_symbols)} 个负费率币种")
+        
+        # 主循环
+        cycle_count = 0
+        while True:
+            try:
+                cycle_count += 1
+                
+                # 执行扫描
+                await self.scan_cycle()
+                
+                # 显示统计（每5次扫描）
+                if cycle_count % 5 == 0:
+                    self.show_statistics()
+                
+                # 计算等待时间
+                wait_time = Config.SCAN_INTERVAL
+                next_scan = datetime.now() + timedelta(seconds=wait_time)
+                
+                print(f"\n⏳ 下次扫描: {next_scan.strftime('%H:%M:%S')}")
+                print(f"   (等待 {wait_time//60} 分钟)")
+                
+                # 等待期间保持活跃
+                for i in range(wait_time // 30):
+                    await asyncio.sleep(30)
+                    if i % 2 == 0:
+                        print(f"   💓 保持活跃... ({i//2 + 1}分)")
+                
+            except KeyboardInterrupt:
+                print("\n\n🛑 用户中断，程序停止")
+                break
+            except Exception as e:
+                print(f"\n❌ 扫描周期异常: {e}")
+                traceback.print_exc()
+                await asyncio.sleep(60)
+
+# ==================== 主函数 ====================
+async def main():
+    """主函数"""
+    # 创建监控器实例
+    monitor = SqueezeMonitor()
+    
+    # 运行监控
+    await monitor.run()
 
 if __name__ == "__main__":
-    main()
+    # 运行异步主函数
+    asyncio.run(main())
