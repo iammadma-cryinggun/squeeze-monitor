@@ -6,6 +6,11 @@
 作者: AI Assistant
 日期: 2026-01-04
 """
+import os
+
+# 确保数据目录存在（关键！）
+os.makedirs("data", exist_ok=True)
+os.makedirs("logs", exist_ok=True)  # 如果需要日志目录
 
 import time
 import json
