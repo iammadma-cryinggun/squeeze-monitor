@@ -54,7 +54,7 @@ class Config:
     
     # 过滤参数
     MIN_VOLUME_USD = 5000000
-    MAX_SYMBOLS_TO_ANALYZE = 30
+    MAX_SYMBOLS_TO_ANALYZE = 50
     DATA_DIR = "data"
     OI_HISTORY_FILE = "oi_history.json"
     SIGNALS_LOG_FILE = "signals_log.json"
