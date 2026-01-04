@@ -167,6 +167,13 @@ class CoinglassClient:
                             continue
                 
                     log(f"Coinglass: 发现 {len(symbols)} 个负费率(<-0.1%)币种", "INFO")
+                    # 按资金费率排序（最负的排前面）
+                    symbols.sort(key=lambda x: x["funding_rate"])
+        
+                    # 限制分析数量
+                    symbols = symbols[:Config.MAX_SYMBOLS_TO_ANALYZE]
+        
+                    log(f"筛选后分析 {len(symbols)} 个最负费率的币种", "INFO")
                     return symbols
                 
         except Exception as e:
