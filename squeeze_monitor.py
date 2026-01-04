@@ -68,12 +68,12 @@ FUNDING_THRESHOLD = -0.001  # 资金费率低于 -0.1%
 OI_SURGE_RATIO = 2.0        # OI 短期均值是长期均值的 2 倍
 SHORT_WINDOW = 3            # 短期窗口（最近3次，约15分钟）
 LONG_WINDOW = 10            # 长期窗口（最近10次，约50分钟）
-SCAN_INTERVAL = 600         # 扫描间隔（10分钟，平衡覆盖率和API压力）
+SCAN_INTERVAL = 300         # 扫描间隔（5分钟，提高扫描频率）
 
-# 过滤条件
-MIN_VOLUME_24H = 10_000_000   # 24h最小交易量 $10M
-MIN_PRICE = 0.001              # 最小价格（过滤极小币种）
-MAX_SYMBOLS_TO_SCAN = 9999     # 扫描所有符合条件的币种
+# 过滤条件 - 降低门槛以获取更多标的
+MIN_VOLUME_24H = 1_000_000   # 24h最小交易量 $1M（降低）
+MIN_PRICE = 0.0001           # 最小价格（降低）
+MAX_SYMBOLS_TO_SCAN = 100    # 限制扫描数量，防止API压力
 
 # 数据存储
 oi_history = {}
@@ -239,9 +239,11 @@ def send_telegram_message(message, alert_type="warning"):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram发送失败: {response.text}")
     except Exception as e:
-        print(f"Telegram发送失败: {e}")
+        print(f"Telegram发送异常: {e}")
 
 def send_wechat_message(message):
     """发送微信警报（Server酱）"""
@@ -251,9 +253,11 @@ def send_wechat_message(message):
         "desp": message
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"微信发送失败: {response.text}")
     except Exception as e:
-        print(f"微信发送失败: {e}")
+        print(f"微信发送异常: {e}")
 
 def send_alert(message, alert_type="warning"):
     """发送所有渠道警报"""
@@ -266,34 +270,73 @@ def send_alert(message, alert_type="warning"):
     send_wechat_message(message)
 
 def fetch_market_data(exchange):
-    """获取市场数据（不再限制交易量）"""
+    """获取市场数据 - 修复版"""
     try:
-        # 获取所有USDT合约的24h统计数据
-        ticker = exchange.fetch_tickers()
-
-        # 过滤
-        filtered = []
-        for symbol, data in ticker.items():
-            if not symbol.endswith('/USDT'):
-                continue
-
-            # 过滤条件
-            if data['quoteVolume'] < MIN_VOLUME_24H:  # 24h交易量过滤
-                continue
-            if data['last'] < MIN_PRICE:
-                continue
-
-            filtered.append({
-                'symbol': symbol,
-                'volume': data['quoteVolume'],
-                'price': data['last'],
-                'change': data['percentage']
-            })
-
-        return filtered  # 返回所有符合条件的币种
-
+        print("   [INFO] 正在获取市场数据...")
+        
+        # 方法1：获取所有永续合约
+        try:
+            markets = exchange.load_markets()
+            print(f"   [DEBUG] 加载的市场总数: {len(markets)}")
+            
+            # 过滤永续合约
+            perpetual_symbols = []
+            for symbol, market in markets.items():
+                # 检查是否为永续合约
+                if market.get('future') and 'USDT' in symbol and 'PERP' in symbol:
+                    # 获取合约信息
+                    contract_type = market.get('info', {}).get('contractType', '')
+                    if contract_type == 'PERPETUAL':
+                        perpetual_symbols.append(symbol.replace(':', ''))  # 移除可能的分隔符
+            
+            print(f"   [DEBUG] 永续合约数量: {len(perpetual_symbols)}")
+            
+            # 只取前 MAX_SYMBOLS_TO_SCAN 个
+            if len(perpetual_symbols) > MAX_SYMBOLS_TO_SCAN:
+                perpetual_symbols = perpetual_symbols[:MAX_SYMBOLS_TO_SCAN]
+            
+            return perpetual_symbols
+            
+        except Exception as e:
+            print(f"   [WARN] 方法1失败: {e}")
+            
+        # 方法2：备选方案，直接从API获取
+        try:
+            # 尝试获取交易所信息
+            exchange_info = exchange.public_get_exchangeinfo()
+            symbols_info = exchange_info.get('symbols', [])
+            
+            filtered_symbols = []
+            for symbol_info in symbols_info:
+                symbol = symbol_info.get('symbol', '')
+                contract_type = symbol_info.get('contractType', '')
+                quote_asset = symbol_info.get('quoteAsset', '')
+                
+                # 过滤条件：永续合约且为USDT计价
+                if contract_type == 'PERPETUAL' and quote_asset == 'USDT':
+                    filtered_symbols.append(symbol)
+            
+            print(f"   [DEBUG] 通过API获取的永续合约数量: {len(filtered_symbols)}")
+            
+            # 限制数量
+            if len(filtered_symbols) > MAX_SYMBOLS_TO_SCAN:
+                filtered_symbols = filtered_symbols[:MAX_SYMBOLS_TO_SCAN]
+            
+            return filtered_symbols
+            
+        except Exception as e:
+            print(f"   [WARN] 方法2失败: {e}")
+            
+        # 方法3：硬编码常见合约
+        print("   [WARN] 使用硬编码合约列表")
+        return [
+            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+            'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'LINKUSDT',
+            'MATICUSDT', 'SHIBUSDT', 'TRXUSDT', 'UNIUSDT', 'ATOMUSDT'
+        ]
+        
     except Exception as e:
-        print(f"获取市场数据失败: {e}")
+        print(f"   [ERROR] 获取市场数据失败: {e}")
         return []
 
 def fetch_data():
@@ -301,49 +344,78 @@ def fetch_data():
     exchange = ccxt.binance(BINANCE_CONFIG)
 
     try:
-        # 1. 获取所有交易对的资金费率
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 开始扫描...")
 
-        funding_rates = exchange.fetch_funding_rates()
-
-        # 2. 获取市场数据（所有符合条件的币种）
+        # 1. 获取市场数据
         all_symbols = fetch_market_data(exchange)
-        symbol_list = [s['symbol'] for s in all_symbols]
-        current_prices = {s['symbol']: s['price'] for s in all_symbols}
+        
+        if not all_symbols:
+            print("   [ERROR] 无法获取市场数据，请检查网络连接")
+            return
+            
+        print(f"   [OK] 监控币种数: {len(all_symbols)}")
+        if len(all_symbols) > 0:
+            print(f"   [示例] 前5个币种: {all_symbols[:5]}")
 
-        print(f"   [OK] 监控币种数: {len(symbol_list)}")
+        # 2. 获取所有交易对的资金费率
+        try:
+            funding_rates = exchange.fetch_funding_rates()
+            print(f"   [OK] 获取资金费率数据: {len(funding_rates)} 个")
+        except Exception as e:
+            print(f"   [ERROR] 获取资金费率失败: {e}")
+            return
 
-        # 3. 检查现有信号的表现
-        check_existing_signals(current_prices)
-
+        current_prices = {}
         alert_count = 0
         scan_count = 0
 
-        # 4. 逐个分析新信号
-        for symbol, data in funding_rates.items():
-            if symbol not in symbol_list:
-                continue
-
-            scan_count += 1
-
-            funding_rate = data.get('fundingRate', 0)
-            mark_price = data.get('markPrice', 0)
-
-            # 获取持仓量
+        # 3. 检查现有信号的表现（先获取价格）
+        for symbol in all_symbols:
             try:
-                oi_data = exchange.fetch_open_interest(symbol)
-                current_oi = oi_data['openInterestAmount']
+                # 获取最新价格
+                ticker = exchange.fetch_ticker(symbol)
+                current_prices[symbol] = ticker['last']
             except:
                 continue
+        
+        if current_prices:
+            check_existing_signals(current_prices)
 
-            # 更新历史记录
-            if symbol not in oi_history:
-                oi_history[symbol] = deque(maxlen=LONG_WINDOW)
-            oi_history[symbol].append(current_oi)
+        # 4. 逐个分析新信号
+        for symbol in all_symbols:
+            scan_count += 1
+            
+            # 显示进度
+            if scan_count % 20 == 0:
+                print(f"   [PROGRESS] 已扫描 {scan_count}/{len(all_symbols)} 个币种")
 
-            # 5. 执行策略逻辑判断
-            if check_strategy(symbol, funding_rate, mark_price):
-                alert_count += 1
+            try:
+                # 获取资金费率
+                if symbol in funding_rates:
+                    funding_data = funding_rates[symbol]
+                    funding_rate = funding_data.get('fundingRate', 0)
+                    mark_price = funding_data.get('markPrice', 0)
+                    
+                    # 获取持仓量
+                    try:
+                        oi_data = exchange.fetch_open_interest(symbol)
+                        current_oi = oi_data['openInterestAmount']
+                    except Exception as e:
+                        # print(f"   [DEBUG] {symbol} OI获取失败: {e}")
+                        continue
+
+                    # 更新历史记录
+                    if symbol not in oi_history:
+                        oi_history[symbol] = deque(maxlen=LONG_WINDOW)
+                    oi_history[symbol].append(current_oi)
+
+                    # 执行策略逻辑判断
+                    if check_strategy(symbol, funding_rate, mark_price):
+                        alert_count += 1
+                        
+            except Exception as e:
+                # print(f"   [DEBUG] {symbol} 处理失败: {e}")
+                continue
 
         print(f"   [OK] 扫描完成: {scan_count} 个币种")
         if alert_count > 0:
@@ -351,9 +423,8 @@ def fetch_data():
         else:
             print(f"   [OK] 未发现轧空信号")
 
-        # 每6小时显示一次统计报告
-        current_hour = datetime.now().hour
-        if current_hour % 6 == 0 and scan_count > 0:
+        # 每次扫描后显示统计报告（便于调试）
+        if scan_count > 0:
             show_statistics()
 
     except Exception as e:
@@ -363,6 +434,9 @@ def fetch_data():
 
 def check_strategy(symbol, funding_rate, mark_price):
     """检查是否满足轧空信号"""
+    if symbol not in oi_history:
+        return False
+        
     history = list(oi_history[symbol])
 
     # 数据不足，跳过
@@ -392,7 +466,7 @@ def check_strategy(symbol, funding_rate, mark_price):
 
         last_alert_time[symbol] = current_time
 
-        # ✅ 记录信号（用于统计胜率）
+        # 记录信号（用于统计胜率）
         record_signal(symbol, funding_rate, oi_ratio, mark_price)
 
         # 构建警报消息
@@ -431,7 +505,7 @@ def main():
     print("="*80)
     print(f"[CONFIG] 监控配置:")
     print(f"   - 扫描频率: 每 {SCAN_INTERVAL//60} 分钟")
-    print(f"   - 监控范围: 所有USDT合约（24h交易量>${MIN_VOLUME_24H/1_000_000:.0f}M）")
+    print(f"   - 监控范围: 主要USDT永续合约")
     print(f"   - 费率阈值: {FUNDING_THRESHOLD:.1%}")
     print(f"   - OI 激增倍数: {OI_SURGE_RATIO}x")
     print(f"   - 止盈: TP1 +5%, TP2 +10%")
