@@ -126,34 +126,32 @@ class CoinglassClient:
         self.base_url = Config.COINGLASS_BASE_URL
     
     def get_negative_funding_symbols(self) -> List[Dict]:
-        """
-        获取所有负费率币种 (阶段1: 极端负费率)
-        返回: [{"symbol": "BTCUSDT", "funding_rate": -0.0012, ...}, ...]
-        """
+        """获取所有负费率币种"""
         try:
             url = f"{self.base_url}/futures/funding-rate/exchange-list"
             response = self.session.get(url, timeout=15)
-            
+        
             if response.status_code == 200:
                 data = response.json()
-                
+            
                 if str(data.get("code")) in ["0", "200"] and "data" in data:
                     symbols = []
-                    
+                
                     for item in data["data"]:
                         try:
                             symbol = item.get("symbol", "")
-                            exchange_list = item.get("token_margin_list", [])
-                            
+                        
+                            # 🔧 修复这里：stablecoin_margin_list 不是 token_margin_list
+                            exchange_list = item.get("stablecoin_margin_list", [])
+                        
                             for exchange_data in exchange_list:
                                 exchange = exchange_data.get("exchange", "").lower()
-                                
+                            
                                 if "binance" in exchange:
                                     rate = exchange_data.get("funding_rate", 0)
                                     if isinstance(rate, str):
                                         rate = float(rate)
-                                    
-                                    # 严格遵循原文: <-0.1%
+                                
                                     if rate < Config.FUNDING_RATE_THRESHOLD:
                                         full_symbol = f"{symbol}USDT"
                                         symbols.append({
@@ -164,16 +162,16 @@ class CoinglassClient:
                                             "timestamp": datetime.now().isoformat()
                                         })
                                         break
-                                        
+                                    
                         except Exception as e:
                             continue
-                    
+                
                     log(f"Coinglass: 发现 {len(symbols)} 个负费率(<-0.1%)币种", "INFO")
                     return symbols
-                    
+                
         except Exception as e:
             log(f"Coinglass获取费率失败: {e}", "ERROR")
-        
+    
         return []
     
     def get_taker_buy_sell_ratio(self, symbol: str) -> Optional[float]:
