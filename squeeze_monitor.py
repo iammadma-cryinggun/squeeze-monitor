@@ -24,7 +24,7 @@ import json
 import os
 
 # 🌐 云端环境检测（自动禁用代理）
-IS_CLOUD = os.environ.get('ZEAEBUR_DEPLOYMENT', '').lower() == 'true' or \
+IS_CLOUD = os.environ.get('ZEABUR_DEPLOYMENT', '').lower() == 'true' or \
            os.environ.get('VERCEL', '') != '' or \
            os.environ.get('DYNO', '') != ''
 
