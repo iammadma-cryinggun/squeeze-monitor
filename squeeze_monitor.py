@@ -434,6 +434,40 @@ class SqueezeMonitor:
     def run(self):
         """主运行循环"""
         print("\n🔧 初始化测试...")
+    
+        # ====== 添加这里 ======
+        # 1. 立即发送启动通知
+        if Config.TELEGRAM_TOKEN and Config.TELEGRAM_CHAT_ID:
+            try:
+                import requests
+                startup_msg = (
+                    "🤖 *轧空监控机器人启动成功！*\n\n"
+                    f"• 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"• 费率阈值: {Config.FUNDING_THRESHOLD:.3%}\n"
+                    f"• OI激增比: {Config.OI_SURGE_RATIO}x\n"
+                    f"• 买盘比率: {Config.TAKER_BUY_RATIO}+\n\n"
+                    "📊 开始扫描市场..."
+                )
+            
+                url = f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage"
+                payload = {
+                    "chat_id": Config.TELEGRAM_CHAT_ID,
+                    "text": startup_msg,
+                    "parse_mode": "Markdown"
+                }
+            
+                response = requests.post(url, json=payload, timeout=10)
+                if response.status_code == 200:
+                    print("✅ 启动通知已发送到Telegram！")
+                else:
+                    print(f"❌ Telegram发送失败: {response.status_code}")
+            except Exception as e:
+                print(f"❌ 启动通知发送失败: {e}")
+        else:
+            print("⚠️  Telegram配置缺失，无法发送启动通知")
+            print(f"   Token已设置: {'是' if Config.TELEGRAM_TOKEN else '否'}")
+            print(f"   Chat ID已设置: {'是' if Config.TELEGRAM_CHAT_ID else '否'}")
+        # ====== 添加结束 ======
         
         # 测试币安连接
         success, btc_price = self.binance.test_connection()
