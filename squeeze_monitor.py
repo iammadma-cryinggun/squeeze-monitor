@@ -1023,6 +1023,72 @@ class SqueezeMonitor:
             except Exception as e:
                 log(f"主循环异常: {e}", "ERROR")
                 time.sleep(60)  # 异常后等待1分钟
+# ==================== 调试函数 ====================
+def quick_debug():
+    """快速调试前5个币种 - 独立运行"""
+    print("="*60)
+    print("🔍 快速调试模式")
+    print("="*60)
+    
+    # 需要导入必要的类
+    fetcher = DataFetcher()
+    symbols = fetcher.get_funding_symbols()[:5]  # 只取前5个
+    
+    print(f"测试前5个最负费率的币种:")
+    
+    for i, symbol_info in enumerate(symbols):
+        symbol = symbol_info["symbol"]
+        funding = symbol_info["funding_rate"]
+        
+        print(f"\n{i+1}. 🔍 {symbol}:")
+        print(f"   资金费率: {funding:.4%} (要求 < {Config.FUNDING_RATE_THRESHOLD:.3%})")
+        
+        # 检查OI
+        oi_ratio, oi_value = fetcher.check_oi_surge(symbol)
+        print(f"   OI激增比: {oi_ratio:.2f}x (要求 > {Config.OI_SURGE_RATIO})")
+        
+        # 检查交易量
+        try:
+            ticker = fetcher.exchange.fetch_ticker(symbol)
+            volume = ticker.get('quoteVolume', 0)
+            print(f"   24h交易量: ${volume/1_000_000:.2f}M (要求 > ${Config.MIN_VOLUME_USD/1_000_000}M)")
+        except Exception as e:
+            print(f"   ❌ 无法获取交易量: {e}")
+            volume = 0
+        
+        # 判断是否通过
+        conditions_passed = 0
+        total_conditions = 2  # 费率已在筛选时通过
+        
+        if funding < Config.FUNDING_RATE_THRESHOLD:
+            conditions_passed += 1
+        
+        if oi_ratio > Config.OI_SURGE_RATIO:
+            conditions_passed += 1
+        else:
+            print(f"   💡 OI激增不足: {oi_ratio:.2f} < {Config.OI_SURGE_RATIO}")
+        
+        if volume > Config.MIN_VOLUME_USD:
+            conditions_passed += 1
+        else:
+            print(f"   💡 交易量不足: ${volume/1_000_000:.2f}M < ${Config.MIN_VOLUME_USD/1_000_000}M")
+        
+        if conditions_passed == total_conditions + 1:  # +1是费率条件
+            print(f"   ✅ 符合所有条件！")
+        else:
+            print(f"   ❌ 通过条件: {conditions_passed}/{total_conditions + 1}")
+    
+    print("\n" + "="*60)
+    print("调试完成。建议：")
+    print("1. 如果多数币种OI < 2.0，考虑降低 OI_SURGE_RATIO")
+    print("2. 如果交易量不足，考虑降低 MIN_VOLUME_USD")
+    print("3. 如果都满足但没信号，检查其他条件")
+    print("="*60)
+
+# ==================== 主函数 ====================
+def main():
+    log("初始化机器人...")
+    # ... 原有代码 ...
 
 # ==================== 主函数 ====================
 if __name__ == "__main__":
