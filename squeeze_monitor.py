@@ -1156,11 +1156,57 @@ def main():
     
   
     log("初始化机器人...")
-    # ... 原有代码 ...
+     # 测试Telegram
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        send_telegram("🤖 轧空监控机器人已启动")
+        log("Telegram通知已启用")
+    
+    fetcher = DataFetcher()
+    alert_cooldown = {}
+    scan_count = 0
+    
+    log("开始监控循环...")
+    
+    while True:
+        try:
+            scan_count += 1
+            log(f"第{scan_count}次扫描")
+            
+            # 获取负费率币种
+            symbols = fetcher.get_funding_symbols()
+            
+            for symbol_info in symbols:
+                signal = analyze_symbol(fetcher, symbol_info)
+                if signal:
+                    symbol = signal["symbol"]
+                    
+                    # 冷却检查
+                    current_time = time.time()
+                    if symbol in alert_cooldown:
+                        if current_time - alert_cooldown[symbol] < 7200:  # 2小时
+                            continue
+                    
+                    alert_cooldown[symbol] = current_time
+                    
+                    # 发送警报
+                    message = format_alert(signal)
+                    if send_telegram(message):
+                        log(f"警报已发送: {symbol}")
+                    
+                    # 简单记录
+                    with open("signals.log", "a") as f:
+                        f.write(f"{signal['time']},{symbol},{signal['funding_rate']},{signal['oi_ratio']}\n")
+            
+            # 等待下次扫描
+            log(f"下次扫描: {SCAN_INTERVAL//60}分钟后")
+            time.sleep(SCAN_INTERVAL)
+            
+        except KeyboardInterrupt:
+            log("程序停止")
+            break
+        except Exception as e:
+            log(f"错误: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
-    # 创建监控实例
-    monitor = SqueezeMonitor()
-    
-    # 运行监控
-    monitor.run()
+    main()
