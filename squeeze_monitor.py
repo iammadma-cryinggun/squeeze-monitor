@@ -432,7 +432,9 @@ class SqueezeSignalAnalyzer:
     完整实现五阶段逻辑链条的监控
     """
     
-    def __init__(self):
+    def __init__(self, coinglass_client, binance_client):
+        self.coinglass = coinglass_client
+        self.binance = binance_client
         self.signals_log = self.load_signals_log()
         self.alert_cooldown = {}  # 警报冷却 {symbol: last_alert_time}
         self.active_tracking = {}  # 正在跟踪的信号 {symbol: {phase, start_time, data}}
@@ -707,14 +709,14 @@ class SqueezeSignalAnalyzer:
         }
         log(f"开始跟踪信号: {symbol}", "INFO")
     
-    def update_tracking(self, binance_client):
+    def update_tracking(self):
         """更新所有活跃信号的跟踪状态"""
         symbols_to_remove = []
         
         for symbol, tracking_data in self.active_tracking.items():
             try:
                 # 检查是否进入阶段4: Long/Short Ratio减少
-                global_ls = binance_client.get_global_long_short_ratio(symbol)
+                global_ls = self.binance.get_global_long_short_ratio(symbol)
                 
                 if global_ls and global_ls.get("trend") == "下降":
                     if tracking_data["phase"] == "PHASE_1_2":
@@ -738,9 +740,9 @@ class SqueezeSignalAnalyzer:
                             log(f"发送阶段更新: {symbol} 进入阶段4", "INFO")
                 
                 # 检查是否进入阶段5: OI减少，费率回归正常
-                current_oi = binance_client.get_open_interest(symbol)
-                if current_oi and symbol in binance_client.oi_history:
-                    history = list(binance_client.oi_history[symbol])
+                current_oi = self.binance.get_open_interest(symbol)
+                if current_oi and symbol in self.binance.oi_history:
+                    history = list(self.binance.oi_history[symbol])
                     if len(history) >= 3:
                         # 检查OI是否从峰值下降超过15%
                         oi_peak = max(history[-5:] if len(history) >= 5 else history)
@@ -794,11 +796,7 @@ class SqueezeMonitor:
     def __init__(self):
         self.coinglass = CoinglassClient()
         self.binance = BinanceDataClient()
-        self.analyzer = SqueezeSignalAnalyzer()
-        
-        # 注入依赖
-        self.analyzer.coinglass = self.coinglass
-        self.analyzer.binance = self.binance
+        self.analyzer = SqueezeSignalAnalyzer(self.coinglass, self.binance)
         
         self.scan_count = 0
         self.total_signals_found = 0
@@ -849,7 +847,7 @@ class SqueezeMonitor:
         if not negative_symbols:
             log("当前市场无符合负费率条件的币种", "INFO")
             # 仍然更新跟踪中的信号
-            self.analyzer.update_tracking(self.binance)
+            self.analyzer.update_tracking()
             return
         
         # 限制分析数量
@@ -902,7 +900,7 @@ class SqueezeMonitor:
                 continue
         
         # 步骤3: 更新所有活跃信号的跟踪状态
-        self.analyzer.update_tracking(self.binance)
+        self.analyzer.update_tracking()
         
         # 步骤4: 保存OI历史数据
         self.binance.save_oi_history()
@@ -1023,190 +1021,15 @@ class SqueezeMonitor:
             except Exception as e:
                 log(f"主循环异常: {e}", "ERROR")
                 time.sleep(60)  # 异常后等待1分钟
-# ==================== 调试函数 ====================
-def quick_debug():
-    """快速调试前5个币种 - 独立运行"""
-    print("="*60)
-    print("🔍 快速调试模式")
-    print("="*60)
-    
-    # 需要导入必要的类
-    fetcher = DataFetcher()
-    symbols = fetcher.get_funding_symbols()[:5]  # 只取前5个
-    
-    print(f"测试前5个最负费率的币种:")
-    
-    for i, symbol_info in enumerate(symbols):
-        symbol = symbol_info["symbol"]
-        funding = symbol_info["funding_rate"]
-        
-        print(f"\n{i+1}. 🔍 {symbol}:")
-        print(f"   资金费率: {funding:.4%} (要求 < {Config.FUNDING_RATE_THRESHOLD:.3%})")
-        
-        # 检查OI
-        oi_ratio, oi_value = fetcher.check_oi_surge(symbol)
-        print(f"   OI激增比: {oi_ratio:.2f}x (要求 > {Config.OI_SURGE_RATIO})")
-        
-        # 检查交易量
-        try:
-            ticker = fetcher.exchange.fetch_ticker(symbol)
-            volume = ticker.get('quoteVolume', 0)
-            print(f"   24h交易量: ${volume/1_000_000:.2f}M (要求 > ${Config.MIN_VOLUME_USD/1_000_000}M)")
-        except Exception as e:
-            print(f"   ❌ 无法获取交易量: {e}")
-            volume = 0
-        
-        # 判断是否通过
-        conditions_passed = 0
-        total_conditions = 2  # 费率已在筛选时通过
-        
-        if funding < Config.FUNDING_RATE_THRESHOLD:
-            conditions_passed += 1
-        
-        if oi_ratio > Config.OI_SURGE_RATIO:
-            conditions_passed += 1
-        else:
-            print(f"   💡 OI激增不足: {oi_ratio:.2f} < {Config.OI_SURGE_RATIO}")
-        
-        if volume > Config.MIN_VOLUME_USD:
-            conditions_passed += 1
-        else:
-            print(f"   💡 交易量不足: ${volume/1_000_000:.2f}M < ${Config.MIN_VOLUME_USD/1_000_000}M")
-        
-        if conditions_passed == total_conditions + 1:  # +1是费率条件
-            print(f"   ✅ 符合所有条件！")
-        else:
-            print(f"   ❌ 通过条件: {conditions_passed}/{total_conditions + 1}")
-    
-    print("\n" + "="*60)
-    print("调试完成。建议：")
-    print("1. 如果多数币种OI < 2.0，考虑降低 OI_SURGE_RATIO")
-    print("2. 如果交易量不足，考虑降低 MIN_VOLUME_USD")
-    print("3. 如果都满足但没信号，检查其他条件")
-    print("="*60)
 
 # ==================== 主函数 ====================
 def main():
-    def main():
-    # ====== 临时调试代码（运行一次后删除）======
-    print("\n" + "="*60)
-    print("🔍 临时调试模式 - 分析前5个币种")
-    print("="*60)
-    
-    fetcher = DataFetcher()
-    
-    # 获取负费率币种
-    headers = {"accept": "application/json", "CG-API-KEY": Config.COINGLASS_API_KEY}
-    url = "https://open-api-v4.coinglass.com/api/futures/funding-rate/exchange-list"
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            
-            # 解析前5个币种
-            test_count = 0
-            for item in data.get("data", []):
-                if test_count >= 5:
-                    break
-                    
-                symbol = item.get("symbol", "")
-                if "INDEX" in symbol or "TOTAL" in symbol:
-                    continue
-                
-                for exchange_data in item.get("stablecoin_margin_list", []):
-                    if "binance" in exchange_data.get("exchange", "").lower():
-                        rate = exchange_data.get("funding_rate", 0)
-                        if isinstance(rate, str):
-                            rate = float(rate)
-                        
-                        if rate < Config.FUNDING_RATE_THRESHOLD:
-                            full_symbol = f"{symbol}USDT"
-                            
-                            print(f"\n{test_count+1}. 🔍 {full_symbol}:")
-                            print(f"   资金费率: {rate:.4%}")
-                            
-                            # 检查OI
-                            oi_ratio, _ = fetcher.check_oi_surge(full_symbol)
-                            print(f"   OI激增比: {oi_ratio:.2f}x (需要>{Config.OI_SURGE_RATIO})")
-                            
-                            # 检查交易量
-                            try:
-                                ticker = fetcher.exchange.fetch_ticker(full_symbol)
-                                volume = ticker.get('quoteVolume', 0)
-                                print(f"   交易量: ${volume/1_000_000:.1f}M (需要>${Config.MIN_VOLUME_USD/1_000_000}M)")
-                            except:
-                                print(f"   无法获取交易量")
-                            
-                            test_count += 1
-                            break
-                
-            print("\n" + "="*60)
-            print("调试完成。关键发现：")
-            print(f"- 多数币种的OI激增比在什么范围？")
-            print(f"- 是否有交易量不足的币种？")
-            print("="*60 + "\n")
-            
-            # 调试后暂停，让你能看到输出
-            time.sleep(10)
-    except Exception as e:
-        print(f"调试失败: {e}")
-    
-    # ====== 临时调试代码结束 ======
-    
-  
+    """主函数"""
     log("初始化机器人...")
-     # 测试Telegram
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        send_telegram("🤖 轧空监控机器人已启动")
-        log("Telegram通知已启用")
     
-    fetcher = DataFetcher()
-    alert_cooldown = {}
-    scan_count = 0
-    
-    log("开始监控循环...")
-    
-    while True:
-        try:
-            scan_count += 1
-            log(f"第{scan_count}次扫描")
-            
-            # 获取负费率币种
-            symbols = fetcher.get_funding_symbols()
-            
-            for symbol_info in symbols:
-                signal = analyze_symbol(fetcher, symbol_info)
-                if signal:
-                    symbol = signal["symbol"]
-                    
-                    # 冷却检查
-                    current_time = time.time()
-                    if symbol in alert_cooldown:
-                        if current_time - alert_cooldown[symbol] < 7200:  # 2小时
-                            continue
-                    
-                    alert_cooldown[symbol] = current_time
-                    
-                    # 发送警报
-                    message = format_alert(signal)
-                    if send_telegram(message):
-                        log(f"警报已发送: {symbol}")
-                    
-                    # 简单记录
-                    with open("signals.log", "a") as f:
-                        f.write(f"{signal['time']},{symbol},{signal['funding_rate']},{signal['oi_ratio']}\n")
-            
-            # 等待下次扫描
-            log(f"下次扫描: {SCAN_INTERVAL//60}分钟后")
-            time.sleep(SCAN_INTERVAL)
-            
-        except KeyboardInterrupt:
-            log("程序停止")
-            break
-        except Exception as e:
-            log(f"错误: {e}")
-            time.sleep(60)
+    # 创建并运行监控器
+    monitor = SqueezeMonitor()
+    monitor.run()
 
 if __name__ == "__main__":
     main()
