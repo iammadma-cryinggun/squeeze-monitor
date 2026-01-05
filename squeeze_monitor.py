@@ -1087,10 +1087,77 @@ def quick_debug():
 
 # ==================== 主函数 ====================
 def main():
+    def main():
+    # ====== 临时调试代码（运行一次后删除）======
+    print("\n" + "="*60)
+    print("🔍 临时调试模式 - 分析前5个币种")
+    print("="*60)
+    
+    fetcher = DataFetcher()
+    
+    # 获取负费率币种
+    headers = {"accept": "application/json", "CG-API-KEY": Config.COINGLASS_API_KEY}
+    url = "https://open-api-v4.coinglass.com/api/futures/funding-rate/exchange-list"
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 解析前5个币种
+            test_count = 0
+            for item in data.get("data", []):
+                if test_count >= 5:
+                    break
+                    
+                symbol = item.get("symbol", "")
+                if "INDEX" in symbol or "TOTAL" in symbol:
+                    continue
+                
+                for exchange_data in item.get("stablecoin_margin_list", []):
+                    if "binance" in exchange_data.get("exchange", "").lower():
+                        rate = exchange_data.get("funding_rate", 0)
+                        if isinstance(rate, str):
+                            rate = float(rate)
+                        
+                        if rate < Config.FUNDING_RATE_THRESHOLD:
+                            full_symbol = f"{symbol}USDT"
+                            
+                            print(f"\n{test_count+1}. 🔍 {full_symbol}:")
+                            print(f"   资金费率: {rate:.4%}")
+                            
+                            # 检查OI
+                            oi_ratio, _ = fetcher.check_oi_surge(full_symbol)
+                            print(f"   OI激增比: {oi_ratio:.2f}x (需要>{Config.OI_SURGE_RATIO})")
+                            
+                            # 检查交易量
+                            try:
+                                ticker = fetcher.exchange.fetch_ticker(full_symbol)
+                                volume = ticker.get('quoteVolume', 0)
+                                print(f"   交易量: ${volume/1_000_000:.1f}M (需要>${Config.MIN_VOLUME_USD/1_000_000}M)")
+                            except:
+                                print(f"   无法获取交易量")
+                            
+                            test_count += 1
+                            break
+                
+            print("\n" + "="*60)
+            print("调试完成。关键发现：")
+            print(f"- 多数币种的OI激增比在什么范围？")
+            print(f"- 是否有交易量不足的币种？")
+            print("="*60 + "\n")
+            
+            # 调试后暂停，让你能看到输出
+            time.sleep(10)
+    except Exception as e:
+        print(f"调试失败: {e}")
+    
+    # ====== 临时调试代码结束 ======
+    
+  
     log("初始化机器人...")
     # ... 原有代码 ...
 
-# ==================== 主函数 ====================
 if __name__ == "__main__":
     # 创建监控实例
     monitor = SqueezeMonitor()
