@@ -39,7 +39,7 @@ class Config:
     FUNDING_RATE_THRESHOLD = -0.0005  # -0.1%
     OI_SURGE_RATIO = 1.1
     OI_SHORT_WINDOW = 3
-    OI_LONG_WINDOW = 10
+    OI_LONG_WINDOW = 3
     SCAN_INTERVAL_SECONDS = 60  # 5分钟
     
     # 多空比
@@ -140,6 +140,9 @@ class CoinglassClient:
                     for item in data["data"]:
                         try:
                             symbol = item.get("symbol", "")
+                            # 核心修复：跳过币安没有的指数代码
+                            if "INDEX" in symbol or "TOTAL" in symbol or "ALL" in symbol:
+                                continue
                         
                             # 🔧 修复这里：stablecoin_margin_list 不是 token_margin_list
                             exchange_list = item.get("stablecoin_margin_list", [])
@@ -856,6 +859,9 @@ class SqueezeMonitor:
         # 步骤2: 分析每个币种
         for i, symbol_data in enumerate(symbols_to_analyze):
             symbol = symbol_data["symbol"]
+            # 二次过滤，确保不查 ALLINDEXUSDT
+            if "INDEX" in symbol:
+                 continue
             
             # 显示进度
             if (i + 1) % 5 == 0:
