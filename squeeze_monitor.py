@@ -36,11 +36,11 @@ class Config:
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "838429342")
     
     # 策略核心
-    FUNDING_RATE_THRESHOLD = -0.001  # -0.1%
-    OI_SURGE_RATIO = 2.0
+    FUNDING_RATE_THRESHOLD = -0.0005  # -0.1%
+    OI_SURGE_RATIO = 1.1
     OI_SHORT_WINDOW = 3
     OI_LONG_WINDOW = 10
-    SCAN_INTERVAL_SECONDS = 300  # 5分钟
+    SCAN_INTERVAL_SECONDS = 60  # 5分钟
     
     # 多空比
     GLOBAL_LS_PERIOD = "1h"
@@ -50,10 +50,10 @@ class Config:
     
     # 主动买卖比
     TAKER_RATIO_PERIOD = "1h"
-    TAKER_BUY_THRESHOLD = 1.2
+    TAKER_BUY_THRESHOLD = 1.0
     
     # 过滤参数
-    MIN_VOLUME_USD = 5000000
+    MIN_VOLUME_USD = 1000000
     MAX_SYMBOLS_TO_ANALYZE = 50
     DATA_DIR = "data"
     OI_HISTORY_FILE = "oi_history.json"
