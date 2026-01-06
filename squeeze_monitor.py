@@ -32,14 +32,14 @@ class Config:
     COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com/api"
     
     # Telegram通知
-    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8216072079:AAFqJjOE81siaDQsHbFIBKBKfWh7SnTRuzI")
+    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8536935536:AAEm1rqdJ-Eo_Urd6-ISnlEYHgNF31M9Tf4")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "838429342")
     
     # 策略核心
     FUNDING_RATE_THRESHOLD = -0.0005  # -0.1%
     OI_SURGE_RATIO = 1.1
     OI_SHORT_WINDOW = 3
-    OI_LONG_WINDOW = 3
+    OI_LONG_WINDOW = 10
     SCAN_INTERVAL_SECONDS = 60  # 5分钟
     
     # 多空比
